@@ -1,3 +1,3 @@
 # Hooklift Apps
 
-Lift plugin for managing apps in Hooklift plaform.
+Lift plugin for managing apps deployed in Hooklift

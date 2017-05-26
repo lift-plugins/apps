@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"github.com/hooklift/lift/ui"
 	"github.com/hooklift/sync"
 	"github.com/pkg/errors"
-
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -74,7 +74,7 @@ func Deploy(ctx context.Context, opts ...CmdOption) error {
 	md := new(DeployMetadata)
 	if err := md.Read(); err != nil && options.appName == "" {
 		// TODO(c4milo): Use logWriter instead?
-		ui.Debug("App metadata doesn't seem to exist, we will create a new app: %s", err.Error())
+		ui.Debug("App metadata doesn't seem to exist, a new app will be created: %s", err.Error())
 	}
 
 	syncID := uuid.NewV4().String()
@@ -91,8 +91,7 @@ func Deploy(ctx context.Context, opts ...CmdOption) error {
 
 	// TODO(c4milo): Create buffered channel with 5 elements of capacity in order
 	// to upload 5 files at a time.
-	// Walk app folder structure
-	filepath.Walk(options.appDir, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(options.appDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return errors.Wrapf(err, "failed walking app source")
 		}
@@ -118,13 +117,21 @@ func Deploy(ctx context.Context, opts ...CmdOption) error {
 		return sync.Push(ctx, f, syncOpts...)
 	})
 
-	md.CacheID = syncID
-	if err := md.Write(); err != nil {
-		return errors.Wrapf(err, "failed writing deployment medatata")
+	if err != nil {
+		ui.Error("failed walking source code: %s", err.Error())
+		ui.Debug("%+v", errors.Wrapf(err, "failed walking source code"))
 	}
+
+	md.CacheID = syncID
+	defer func() {
+		if err := md.Write(); err != nil {
+			ui.Error("failed writing metadata: %s", err.Error())
+			ui.Debug("%+v", errors.Wrapf(err, "failed writing deployment medatata"))
+		}
+	}()
 	ui.Info("done\n")
 
-	res, err := options.syncClient.Deploy(ctx, &sync.DeployRequest{
+	stream, err := options.syncClient.Deploy(ctx, &sync.DeployRequest{
 		AppId:  md.AppID,
 		SyncId: syncID,
 	})
@@ -133,9 +140,32 @@ func Deploy(ctx context.Context, opts ...CmdOption) error {
 		return errors.Wrapf(err, "failed deploying")
 	}
 
-	_ = res.OutputUrl
-	// TODO(c4milo): gRPC request to output URL in order to read deploy logs?
-	// TODO(c4milo): From server, close connection once deployment is done.
+	reader := bytes.NewReader(nil)
+	for {
+		res, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			appErr := res.GetError()
+			if appErr != nil {
+				return appErr
+			}
+			return errors.Wrapf(err, "failed reading stream from server")
+		}
+
+		if md.AppID == "" && res.GetAppInfo() != nil {
+			md.AppID = res.GetAppInfo().Id
+			continue
+		}
+
+		reader.Reset(res.GetLogOutput())
+		_, err = io.Copy(options.logOutput, reader)
+		if err != nil {
+			ui.Error("failed reading log output from server: %s", err.Error())
+		}
+	}
 
 	return nil
 }
